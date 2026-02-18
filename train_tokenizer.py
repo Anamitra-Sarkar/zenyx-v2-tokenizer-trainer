@@ -8,7 +8,7 @@
 # ══════════════════════════════════════════════════════════════════════
 # §0  CONFIG
 # ══════════════════════════════════════════════════════════════════════
-HF_TOKEN = "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"
+HF_TOKEN = "hf_toen"
 REPO_ID  = "Arko007/zenyx-v2-tokenizer"
 SAVE_DIR = "./zenyx_tokenizer"
 
