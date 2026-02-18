@@ -3,13 +3,13 @@
 # ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Truly Resumable        ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
-# !pip install -U -q transformers datasets tokenizers huggingface_hub
+!pip install -U -q transformers datasets tokenizers huggingface_hub
 
 # ══════════════════════════════════════════════════════════════════════
 # §0  CONFIG
 # ══════════════════════════════════════════════════════════════════════
-HF_TOKEN = "hf_YOUR_TOKEN_HERE"
-REPO_ID  = "your_username/zenyx-v2-tokenizer"
+HF_TOKEN = "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"
+REPO_ID  = "Arko007/zenyx-v2-tokenizer"
 SAVE_DIR = "./zenyx_tokenizer"
 
 VOCAB_SIZE          = 32_768
