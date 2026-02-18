@@ -51,7 +51,8 @@ from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel, Digits, Split, Sequence as PTSequence
 from tokenizers import processors, decoders
-from huggingface_hub import HfApi, HfFolder, create_repo
+# HfFolder was removed in huggingface_hub>=0.20 — use login() instead
+from huggingface_hub import HfApi, login, create_repo
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +65,8 @@ log = logging.getLogger("ZenyxV2")
 # §2  HF SETUP
 # ══════════════════════════════════════════════════════════════════════
 def setup_hf_repo() -> None:
-    HfFolder.save_token(HF_TOKEN)
+    # login() persists the token to ~/.cache/huggingface/token
+    login(token=HF_TOKEN, add_to_git_credential=False)
     api = HfApi()
     try:
         api.repo_info(repo_id=REPO_ID, repo_type="model", token=HF_TOKEN)
