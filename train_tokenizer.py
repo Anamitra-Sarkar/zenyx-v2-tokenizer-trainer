@@ -1,13 +1,13 @@
-# ╔════════════════════════════════════════════════════════════════════╗
-# ║   ZENYX-V2 TOKENIZER TRAINER  —  FINAL PRODUCTION v5               ║
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║   ZENYX-V2 TOKENIZER TRAINER  —  FINAL PRODUCTION v6               ║
 # ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Truly Resumable        ║
-# ╚════════════════════════════════════════════════════════════════════╝
+# ╚══════════════════════════════════════════════════════════════════════╝
 
 # !pip install -U -q transformers datasets tokenizers huggingface_hub
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §0  CONFIG
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 HF_TOKEN = "hf_YOUR_TOKEN_HERE"
 REPO_ID  = "your_username/zenyx-v2-tokenizer"
 SAVE_DIR = "./zenyx_tokenizer"
@@ -23,6 +23,9 @@ FINEWEB_MIN_SCORE      = 4.8
 TRAIN_BATCH_SIZE       = 1_000
 CHECKPOINT_INTERVAL_MB = 50
 
+# Heartbeat: log a progress line every N rows even before first checkpoint
+HEARTBEAT_ROWS = 1_000
+
 CHECKPOINT_FILE = "./zenyx_checkpoint.json"
 SPOOL_FILE      = "./zenyx_spool.jsonl"
 
@@ -36,9 +39,9 @@ SPECIAL_TOKENS = [
     "<verify>",
 ]
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §1  IMPORTS
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 import os, sys, json, time, logging, unicodedata
 from pathlib import Path
 
@@ -57,9 +60,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("ZenyxV2")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §2  HF SETUP
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def setup_hf_repo() -> None:
     HfFolder.save_token(HF_TOKEN)
     api = HfApi()
@@ -71,9 +74,9 @@ def setup_hf_repo() -> None:
                     repo_type="model", private=False, exist_ok=True)
         log.info(f"[HF] Repo '{REPO_ID}' created.")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §3  CHECKPOINT
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 EMPTY_CKPT = {
     "rows_math": 0, "rows_code": 0, "rows_english": 0,
     "bytes_math": 0, "bytes_code": 0, "bytes_english": 0,
@@ -106,9 +109,9 @@ def print_session_status(ckpt: dict) -> None:
     done_mb  = ckpt["bytes_written"] / 1e6
     total_mb = TARGET_CORPUS_BYTES / 1e6
     pct      = 100 * ckpt["bytes_written"] / TARGET_CORPUS_BYTES
-    print("\n" + "━" * 60)
-    print("  ZENYX-V2  —  SESSION STATUS")
-    print("━" * 60)
+    print("\n" + "\u2501" * 60)
+    print("  ZENYX-V2  \u2014  SESSION STATUS")
+    print("\u2501" * 60)
     print(f"  Corpus spooled : {done_mb:.1f} MB / {total_mb:.0f} MB ({pct:.1f}%)")
     print(f"  Rows           : math={ckpt['rows_math']:,}  "
           f"code={ckpt['rows_code']:,}  eng={ckpt['rows_english']:,}")
@@ -117,11 +120,11 @@ def print_session_status(ckpt: dict) -> None:
           f"eng={ckpt['bytes_english']/1e6:.1f}MB")
     print(f"  Spool complete : {'\u2713' if ckpt['spool_complete'] else '\u2717 (will resume)'}")
     print(f"  Training done  : {'\u2713' if ckpt['training_complete'] else '\u2717 (will train)'}")
-    print("━" * 60 + "\n")
+    print("\u2501" * 60 + "\n")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §4  DISK SAFETY
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def check_disk_space() -> None:
     stat   = os.statvfs(".")
     free   = stat.f_bavail * stat.f_frsize
@@ -132,9 +135,9 @@ def check_disk_space() -> None:
             f"Insufficient disk: {free/1e9:.2f}GB free, {needed/1e9:.2f}GB needed."
         )
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §5  TEXT SANITISATION
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def _to_ascii_digit(ch: str) -> str:
     try:
         val = unicodedata.numeric(ch)
@@ -158,18 +161,20 @@ def sanitise_text(text: str) -> str | None:
     )
     return text
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §6  STREAMING SOURCES
 #     Each yields (text, byte_len). skip_rows enables true resume.
 #     NOTE: .skip(n) is O(n) — resume time scales with rows skipped.
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def stream_finemath(target_bytes: int, skip_rows: int = 0):
-    log.info(f"[MATH] finemath-4plus | skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
+    log.info(f"[MATH] Loading finemath-4plus...")
     ds = load_dataset("HuggingFaceTB/finemath", name="finemath-4plus",
                       split="train", streaming=True)
+    log.info(f"[MATH] Dataset ready | skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
     if skip_rows > 0:
         ds = ds.skip(skip_rows)
     consumed = 0
+    row_count = 0
     for row in ds:
         text = sanitise_text(row.get("text", ""))
         if text is None:
@@ -177,6 +182,9 @@ def stream_finemath(target_bytes: int, skip_rows: int = 0):
         blen = len(text.encode("utf-8"))
         yield text, blen
         consumed += blen
+        row_count += 1
+        if row_count % HEARTBEAT_ROWS == 0:
+            log.info(f"[MATH] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
         if consumed >= target_bytes:
             break
 
@@ -212,6 +220,7 @@ def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
     log.info(f"[CODE] {len(streams)} stream(s) | skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
 
     consumed = 0
+    row_count = 0
     for row in combined:
         text = sanitise_text(row.get("content", row.get("text", "")))
         if text is None or len(text.strip()) < 20:
@@ -219,18 +228,26 @@ def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
         blen = len(text.encode("utf-8"))
         yield text, blen
         consumed += blen
+        row_count += 1
+        if row_count % HEARTBEAT_ROWS == 0:
+            log.info(f"[CODE] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
         if consumed >= target_bytes:
             break
 
 
 def stream_fineweb_edu(target_bytes: int, skip_rows: int = 0):
-    log.info(f"[ENG] fineweb-edu | score>{FINEWEB_MIN_SCORE} | "
-             f"skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="CC-MAIN-2024-10",
+    # FIX v6: use sample-10BT instead of CC-MAIN-2024-10
+    # CC-MAIN-2024-10 is a raw dump shard (~500GB+), extremely slow to init on Kaggle.
+    # sample-10BT is the official recommended config: pre-deduplicated, fast to stream.
+    log.info(f"[ENG] Loading fineweb-edu (sample-10BT)...")
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
+    log.info(f"[ENG] Dataset ready | score>{FINEWEB_MIN_SCORE} | "
+             f"skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
     if skip_rows > 0:
         ds = ds.skip(skip_rows)
     consumed = 0
+    row_count = 0
     for row in ds:
         if row.get("score", 0.0) <= FINEWEB_MIN_SCORE:
             continue
@@ -240,12 +257,15 @@ def stream_fineweb_edu(target_bytes: int, skip_rows: int = 0):
         blen = len(text.encode("utf-8"))
         yield text, blen
         consumed += blen
+        row_count += 1
+        if row_count % HEARTBEAT_ROWS == 0:
+            log.info(f"[ENG] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
         if consumed >= target_bytes:
             break
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §7  CORPUS SPOOLER
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def _flush_checkpoint(sf, ckpt: dict,
                       pending_rows: dict, pending_bytes: dict,
                       total_consumed: int,
@@ -296,9 +316,11 @@ def spool_corpus_to_disk(ckpt: dict) -> None:
     code_target    = int(TARGET_CORPUS_BYTES * CODE_RATIO)
     english_target = int(TARGET_CORPUS_BYTES * ENGLISH_RATIO)
 
+    log.info("[SPOOL] Initialising all three generators (may take 1-3 min each)...")
     gen_math    = stream_finemath(math_target,       skip_rows=ckpt["rows_math"])
     gen_code    = stream_stack_edu(code_target,      skip_rows=ckpt["rows_code"])
     gen_english = stream_fineweb_edu(english_target, skip_rows=ckpt["rows_english"])
+    log.info("[SPOOL] All generators initialised. Starting interleaved write loop.")
 
     sources_raw = [
         ("math",    gen_math,    math_target,    4),
@@ -325,6 +347,7 @@ def spool_corpus_to_disk(ckpt: dict) -> None:
 
     total_consumed = ckpt["bytes_written"]
     next_ckpt_at   = total_consumed + CHECKPOINT_INTERVAL_MB * 1024 * 1024
+    total_rows     = 0
 
     if ckpt["ts_spool_start"] is None:
         ckpt["ts_spool_start"] = time.time()
@@ -370,6 +393,7 @@ def spool_corpus_to_disk(ckpt: dict) -> None:
             total_consumed      += blen
             pending_rows[name]  += 1
             pending_bytes[name] += blen
+            total_rows          += 1
 
             if total_consumed >= next_ckpt_at:
                 _flush_checkpoint(sf, ckpt, pending_rows, pending_bytes, total_consumed)
@@ -377,15 +401,15 @@ def spool_corpus_to_disk(ckpt: dict) -> None:
                 log.info(f"[SPOOL] {total_consumed/1e6:.0f}MB ({pct:.1f}%)  "
                          f"math={consumed['math']/1e6:.0f}MB  "
                          f"code={consumed['code']/1e6:.0f}MB  "
-                         f"eng={consumed['english']/1e6:.0f}MB")
+                         f"eng={consumed['english']/1e6:.0f}MB  "
+                         f"rows={total_rows:,}")
                 next_ckpt_at = total_consumed + CHECKPOINT_INTERVAL_MB * 1024 * 1024
 
-        # Final commit with mark_complete=True — atomic: spool_complete written
-        # in the same save_checkpoint call as the final offset/byte counts.
+        # Final atomic commit — spool_complete set inside same save_checkpoint call
         _flush_checkpoint(sf, ckpt, pending_rows, pending_bytes,
                           total_consumed, mark_complete=True)
 
-    log.info(f"[SPOOL] Complete: {total_consumed/1e6:.1f}MB.")
+    log.info(f"[SPOOL] Complete: {total_consumed/1e6:.1f}MB | {total_rows:,} rows.")
 
 
 def spool_reader():
@@ -408,13 +432,13 @@ def count_spool_lines() -> int:
     with open(SPOOL_FILE, "rb") as f:
         return sum(1 for _ in f)
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §8  PRE-TOKENIZER
 #
 # Split (canonical GPT-2, Rust-safe, no \p{N}, no lookaheads)
 #   → Digits(individual_digits=True)
 #   → ByteLevel(add_prefix_space=False, use_regex=False)
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def build_pretokenizer() -> PTSequence:
     regex = Regex(
         r"""'s|'t|'re|'ve|'m|'ll|'d"""
@@ -429,9 +453,9 @@ def build_pretokenizer() -> PTSequence:
         ByteLevel(add_prefix_space=False, use_regex=False),
     ])
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §9  TOKENIZER + TRAINER
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def build_tokenizer() -> Tokenizer:
     model = BPE(unk_token="<|unk|>", fuse_unk=False)
     tok   = Tokenizer(model)
@@ -451,9 +475,9 @@ def build_trainer() -> BpeTrainer:
         special_tokens=SPECIAL_TOKENS,
     )
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §10  TRAINING
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def train_tokenizer(ckpt: dict) -> Tokenizer:
     tok     = build_tokenizer()
     trainer = build_trainer()
@@ -487,9 +511,9 @@ def train_tokenizer(ckpt: dict) -> Tokenizer:
     log.info(f"[TRAIN] Done in {elapsed/60:.1f}min | vocab={tok.get_vocab_size():,}")
     return tok
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §11  SAVE
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def save_tokenizer(tok: Tokenizer) -> dict:
     Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
     vocab = tok.get_vocab()
@@ -548,9 +572,9 @@ def save_tokenizer(tok: Tokenizer) -> dict:
     log.info(f"[SAVE] All files written to {SAVE_DIR}/")
     return {"tokenizer_json": tj_path, "config": cfg_path, "stm": stm_path}
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §12  UPLOAD
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def upload_to_hub(file_paths: dict) -> None:
     api = HfApi()
     log.info(f"[UPLOAD] Pushing to '{REPO_ID}'...")
@@ -563,13 +587,13 @@ def upload_to_hub(file_paths: dict) -> None:
         log.info(f"[UPLOAD] \u2713 {os.path.basename(local_path)}")
     log.info(f"[UPLOAD] https://huggingface.co/{REPO_ID}")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §13  SMOKE TESTS
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def run_smoke_tests() -> None:
-    print("\n" + "─" * 60)
+    print("\n" + "\u2500" * 60)
     print("  SMOKE TESTS")
-    print("─" * 60)
+    print("\u2500" * 60)
 
     try:
         Regex(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?[^\s\p{L}]+[\r\n]*|\s*[\r\n]+|\s+""")
@@ -611,11 +635,11 @@ def run_smoke_tests() -> None:
         f"'#include' punct merged into word: {tokens}"
     print(f"  [\u2713] '#include' punct isolated: {tokens}")
 
-    print("─" * 60 + "\n")
+    print("\u2500" * 60 + "\n")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §14  VERIFICATION
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def run_verification() -> None:
     from transformers import PreTrainedTokenizerFast
 
@@ -684,9 +708,9 @@ def run_verification() -> None:
 
     print("\n" + "\u2550" * 68 + "\n")
 
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 # §15  MAIN
-# ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
 def main():
     print("\n" + "\u2588" * 60)
     print(f"  ZENYX-V2  |  vocab={VOCAB_SIZE:,}  |  corpus={TARGET_CORPUS_BYTES/1e9:.1f}GB")
