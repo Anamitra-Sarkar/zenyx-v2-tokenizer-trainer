@@ -43,8 +43,12 @@ SPECIAL_TOKENS = [
 import os, sys, json, time, logging, unicodedata
 from pathlib import Path
 
-# FIX: Force line-buffered stdout so Kaggle shows every log line immediately.
-sys.stdout.reconfigure(line_buffering=True)
+# Kaggle's IPython kernel uses OutStream (not TextIOWrapper) for sys.stdout,
+# which does not support .reconfigure(). Guard it so the run never crashes here.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # OutStream / any non-TextIOWrapper stdout — line-buffering not needed
 
 from datasets import load_dataset, interleave_datasets
 from tokenizers import Tokenizer, Regex
