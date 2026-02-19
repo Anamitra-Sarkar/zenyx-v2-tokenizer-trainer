@@ -254,6 +254,13 @@ def stream_starcoderdata(target_bytes: int):
         log.error("[CODE] No code streams available!")
         return
 
+    # FIX: Different language subsets of bigcode/starcoderdata carry different
+    # metadata columns (e.g. avg_line_length, max_stars_count, etc. vary by
+    # language). interleave_datasets() requires ALL streams to share identical
+    # features, so we normalise every stream to only the 'content' column —
+    # the only column we actually consume — before interleaving.
+    streams = [s.select_columns(["content"]) for s in streams]
+
     combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
     log.info(f"[CODE] {len(streams)}/{len(lang_dirs)} languages active | "
              f"target={target_bytes/1e6:.0f}MB")
