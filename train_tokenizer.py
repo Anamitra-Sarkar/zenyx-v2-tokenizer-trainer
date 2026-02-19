@@ -43,7 +43,6 @@ import os, sys, json, time, logging, unicodedata
 from pathlib import Path
 
 # FIX: Force line-buffered stdout so Kaggle shows every log line immediately.
-# Without this, Python buffers output and the notebook looks "dead" for minutes.
 sys.stdout.reconfigure(line_buffering=True)
 
 from datasets import load_dataset, interleave_datasets
@@ -66,8 +65,8 @@ log = logging.getLogger("ZenyxV2")
 # ══════════════════════════════════════════════════════════════════════
 def setup_hf_repo() -> bool:
     """Returns True if HF is reachable and repo is ready, False otherwise.
-    FIX: Wrapped in try/except so a bad/revoked token NEVER kills the run
-    before training starts. Training proceeds regardless; upload may fail later.
+    Wrapped in try/except so a bad/revoked token NEVER kills the run
+    before training starts.
     """
     try:
         login(token=HF_TOKEN, add_to_git_credential=False)
@@ -162,10 +161,9 @@ def sanitise_text(text: str) -> str | None:
 # ══════════════════════════════════════════════════════════════════════
 # §6  STREAMING SOURCES
 #
-# FIX: Using HuggingFaceTB/stack-edu with CONFIRMED config names
-# (Python, Java, C, Cpp). These were verified working in prior runs.
-# smollm-corpus was incorrectly used in v8-draft — its configs are
-# cosmopedia-v2, python-edu, fineweb-edu-dedup; NOT language names.
+# stack-edu config names are the exact language label used by HuggingFaceTB.
+# All 15 are attempted; any that don’t exist on the hub are skipped with a
+# warning — the rest are interleaved normally.
 # ══════════════════════════════════════════════════════════════════════
 def stream_finemath(target_bytes: int):
     log.info(f"[MATH] Loading finemath-4plus (streaming)...")
@@ -194,29 +192,47 @@ def stream_finemath(target_bytes: int):
 
 
 def stream_stack_edu(target_bytes: int):
-    # Confirmed working configs from HuggingFaceTB/stack-edu (verified in run logs)
+    # All 15 languages available in HuggingFaceTB/stack-edu.
+    # Config name (value) = exact name used by the HuggingFace dataset hub.
+    # Any config that doesn’t exist is silently skipped; the rest are interleaved.
     lang_map = {
-        "Python": "Python",
-        "Java":   "Java",
-        "C":      "C",
-        "C++":    "Cpp",
+        # --- confirmed working from prior runs ---
+        "Python":     "Python",
+        "Java":       "Java",
+        "C":          "C",
+        "C++":        "Cpp",
+        # --- extended set ---
+        "JavaScript": "JavaScript",
+        "TypeScript": "TypeScript",
+        "SQL":        "SQL",
+        "Go":         "Go",
+        "Rust":       "Rust",
+        "PHP":        "PHP",
+        "Ruby":       "Ruby",
+        "Swift":      "Swift",
+        "Kotlin":     "Kotlin",
+        "Scala":      "Scala",
+        "Shell":      "Shell",
     }
+
     streams = []
+    log.info(f"[CODE] Loading {len(lang_map)} language configs from stack-edu...")
     for lang_name, config in lang_map.items():
         try:
             ds = load_dataset("HuggingFaceTB/stack-edu", name=config,
                               split="train", streaming=True)
             streams.append(ds)
-            log.info(f"[CODE] Config '{config}' ({lang_name}) ✓")
+            log.info(f"[CODE]   + {config:<14} ({lang_name}) ✓")
         except Exception as e:
-            log.warning(f"[CODE] Config '{config}' failed ({e}). Skipping.")
+            log.warning(f"[CODE]   - {config:<14} ({lang_name}) ✗  ({e})")
 
     if not streams:
         log.error("[CODE] No code streams available!")
         return
 
     combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
-    log.info(f"[CODE] {len(streams)}/4 languages active | target={target_bytes/1e6:.0f}MB")
+    log.info(f"[CODE] {len(streams)}/{len(lang_map)} languages active | "
+             f"target={target_bytes/1e6:.0f}MB")
 
     consumed  = 0
     row_count = 0
@@ -265,9 +281,6 @@ def stream_fineweb_edu(target_bytes: int):
 # ══════════════════════════════════════════════════════════════════════
 # §7  TRUE STREAMING COMBINER
 #     Feeds text directly into the BPE trainer — no spool file at all.
-#     This is why the old code "did nothing for 9k seconds": it was
-#     writing 1GB to disk BEFORE starting training. Now training starts
-#     after the first batch of rows arrives (~seconds).
 # ══════════════════════════════════════════════════════════════════════
 def stream_combined_for_training():
     math_target    = int(TARGET_CORPUS_BYTES * MATH_RATIO)
@@ -283,7 +296,6 @@ def stream_combined_for_training():
     log.info(f"[STREAM] Targets → math={math_target/1e6:.0f}MB  "
              f"code={code_target/1e6:.0f}MB  eng={english_target/1e6:.0f}MB")
 
-    # Weights: Math=4, Code=4, English=2  (matches 40/40/20 ratio)
     sources_raw = [
         ("math",    gen_math,    math_target,    4),
         ("code",    gen_code,    code_target,    4),
@@ -386,7 +398,6 @@ def train_tokenizer(ckpt: dict) -> Tokenizer:
     trainer = build_trainer()
 
     # estimated_rows is a hint to BpeTrainer progress bar only — not a hard limit.
-    # avg ~300 bytes/row across math+code+english mix
     estimated_rows = max(TARGET_CORPUS_BYTES // 300, 1)
     log.info(f"[TRAIN] est_rows={estimated_rows:,} | True streaming to trainer started.")
 
