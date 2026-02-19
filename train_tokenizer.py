@@ -1,13 +1,14 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v8 (Fixed)         ║
+# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v9                 ║
 # ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Direct Stream Train    ║
+# ║   Code source: bigcode/starcoderdata (real text, 25 languages)     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 !pip install -U -q transformers datasets tokenizers huggingface_hub
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §0  CONFIG
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 HF_TOKEN = "hf_token"   # <<< Replace with your actual write token in Kaggle
 REPO_ID  = "Arko007/zenyx-v2-tokenizer"
 SAVE_DIR = "./zenyx_tokenizer"
@@ -36,9 +37,9 @@ SPECIAL_TOKENS = [
     "<verify>",
 ]
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §1  IMPORTS
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 import os, sys, json, time, logging, unicodedata
 from pathlib import Path
 
@@ -60,9 +61,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("ZenyxV2")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §2  HF SETUP
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def setup_hf_repo() -> bool:
     """Returns True if HF is reachable and repo is ready, False otherwise.
     Wrapped in try/except so a bad/revoked token NEVER kills the run
@@ -83,9 +84,9 @@ def setup_hf_repo() -> bool:
         log.warning(f"[HF] Setup failed ({e}). Training will proceed; upload may fail.")
         return False
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §3  CHECKPOINT
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 EMPTY_CKPT = {
     "training_complete":   False,
     "vocab_size_achieved": 0,
@@ -119,9 +120,9 @@ def print_session_status(ckpt: dict) -> None:
         print(f"  Vocab achieved : {ckpt['vocab_size_achieved']:,}")
     print("━" * 60 + "\n")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §4  DISK SAFETY
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def check_disk_space() -> None:
     stat   = os.statvfs(".")
     free   = stat.f_bavail * stat.f_frsize
@@ -132,9 +133,9 @@ def check_disk_space() -> None:
             f"Insufficient disk: {free/1e9:.2f}GB free, {needed/1e6:.0f}MB needed."
         )
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §5  TEXT SANITISATION
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def _to_ascii_digit(ch: str) -> str:
     try:
         val = unicodedata.numeric(ch)
@@ -158,13 +159,17 @@ def sanitise_text(text: str) -> str | None:
     )
     return text
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §6  STREAMING SOURCES
 #
-# stack-edu config names are the exact language label used by HuggingFaceTB.
-# All 15 are attempted; any that don’t exist on the hub are skipped with a
-# warning — the rest are interleaved normally.
-# ══════════════════════════════════════════════════════════════════════
+# bigcode/starcoderdata — 783GB, 86 languages, real `content` column.
+# Use data_dir=<folder_name> to select a language. All folder names are
+# lowercase and match the directory listing on the HF hub exactly.
+#
+# Skipped (different column schema — no `content` field):
+#   jupyter-scripts-dedup-filtered, jupyter-structured-clean-dedup,
+#   github-issues-filtered-structured, git-commits-cleaned
+# ══════════════════════════════════════════════════════════════════════════
 def stream_finemath(target_bytes: int):
     log.info(f"[MATH] Loading finemath-4plus (streaming)...")
     try:
@@ -191,54 +196,69 @@ def stream_finemath(target_bytes: int):
             break
 
 
-def stream_stack_edu(target_bytes: int):
-    # All 15 languages available in HuggingFaceTB/stack-edu.
-    # Config name (value) = exact name used by the HuggingFace dataset hub.
-    # Any config that doesn’t exist is silently skipped; the rest are interleaved.
-    lang_map = {
-        # --- confirmed working from prior runs ---
-        "Python":     "Python",
-        "Java":       "Java",
-        "C":          "C",
-        "C++":        "Cpp",
-        # --- extended set ---
-        "JavaScript": "JavaScript",
-        "TypeScript": "TypeScript",
-        "SQL":        "SQL",
-        "Go":         "Go",
-        "Rust":       "Rust",
-        "PHP":        "PHP",
-        "Ruby":       "Ruby",
-        "Swift":      "Swift",
-        "Kotlin":     "Kotlin",
-        "Scala":      "Scala",
-        "Shell":      "Shell",
-    }
+def stream_starcoderdata(target_bytes: int):
+    # 25 industry-relevant languages from bigcode/starcoderdata.
+    # data_dir value = exact folder name on the HF hub (all lowercase).
+    # Any that fail to load are skipped with a warning; the rest stream normally.
+    lang_dirs = [
+        # ── Tier 1: highest demand ──────────────────────────────────────
+        "python",
+        "javascript",
+        "typescript",
+        "java",
+        "c",
+        "cpp",
+        "c-sharp",
+        "go",
+        "rust",
+        # ── Tier 2: very commonly used ──────────────────────────────────
+        "kotlin",
+        "php",
+        "ruby",
+        "shell",
+        "sql",
+        "html",
+        "css",
+        "markdown",
+        # ── Tier 3: useful extras ────────────────────────────────────────
+        "yaml",
+        "json",
+        "dockerfile",
+        "cuda",
+        "r",
+        "dart",
+        "swift",
+        "scala",
+    ]
 
     streams = []
-    log.info(f"[CODE] Loading {len(lang_map)} language configs from stack-edu...")
-    for lang_name, config in lang_map.items():
+    log.info(f"[CODE] Loading {len(lang_dirs)} languages from bigcode/starcoderdata...")
+    for lang in lang_dirs:
         try:
-            ds = load_dataset("HuggingFaceTB/stack-edu", name=config,
-                              split="train", streaming=True)
+            ds = load_dataset(
+                "bigcode/starcoderdata",
+                data_dir=lang,
+                split="train",
+                streaming=True,
+            )
             streams.append(ds)
-            log.info(f"[CODE]   + {config:<14} ({lang_name}) ✓")
+            log.info(f"[CODE]   + {lang:<20} ✓")
         except Exception as e:
-            log.warning(f"[CODE]   - {config:<14} ({lang_name}) ✗  ({e})")
+            log.warning(f"[CODE]   - {lang:<20} ✗  ({e})")
 
     if not streams:
         log.error("[CODE] No code streams available!")
         return
 
     combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
-    log.info(f"[CODE] {len(streams)}/{len(lang_map)} languages active | "
+    log.info(f"[CODE] {len(streams)}/{len(lang_dirs)} languages active | "
              f"target={target_bytes/1e6:.0f}MB")
 
     consumed  = 0
     row_count = 0
     for row in combined:
-        raw_text = row.get("content", row.get("text", ""))
-        text = sanitise_text(raw_text)
+        # bigcode/starcoderdata uses `content` column for actual code text
+        text = sanitise_text(row.get("content", ""))
         if text is None or len(text.strip()) < 20:
             continue
         blen = len(text.encode("utf-8"))
@@ -278,10 +298,10 @@ def stream_fineweb_edu(target_bytes: int):
         if consumed >= target_bytes:
             break
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §7  TRUE STREAMING COMBINER
 #     Feeds text directly into the BPE trainer — no spool file at all.
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def stream_combined_for_training():
     math_target    = int(TARGET_CORPUS_BYTES * MATH_RATIO)
     code_target    = int(TARGET_CORPUS_BYTES * CODE_RATIO)
@@ -289,7 +309,7 @@ def stream_combined_for_training():
 
     log.info("[STREAM] Initialising streaming generators...")
     gen_math    = stream_finemath(math_target)
-    gen_code    = stream_stack_edu(code_target)
+    gen_code    = stream_starcoderdata(code_target)
     gen_english = stream_fineweb_edu(english_target)
 
     log.info("[STREAM] Generators ready. Streaming directly to BPE trainer.")
@@ -352,9 +372,9 @@ def stream_combined_for_training():
 
         yield text
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §8  PRE-TOKENIZER
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def build_pretokenizer() -> PTSequence:
     regex = Regex(
         r"""'s|'t|'re|'ve|'m|'ll|'d"""
@@ -369,9 +389,9 @@ def build_pretokenizer() -> PTSequence:
         ByteLevel(add_prefix_space=False, use_regex=False),
     ])
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §9  TOKENIZER + TRAINER
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def build_tokenizer() -> Tokenizer:
     model = BPE(unk_token="<|unk|>", fuse_unk=False)
     tok   = Tokenizer(model)
@@ -390,14 +410,13 @@ def build_trainer() -> BpeTrainer:
         special_tokens=SPECIAL_TOKENS,
     )
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §10  TRAINING
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def train_tokenizer(ckpt: dict) -> Tokenizer:
     tok     = build_tokenizer()
     trainer = build_trainer()
 
-    # estimated_rows is a hint to BpeTrainer progress bar only — not a hard limit.
     estimated_rows = max(TARGET_CORPUS_BYTES // 300, 1)
     log.info(f"[TRAIN] est_rows={estimated_rows:,} | True streaming to trainer started.")
 
@@ -420,9 +439,9 @@ def train_tokenizer(ckpt: dict) -> Tokenizer:
     log.info(f"[TRAIN] Done in {elapsed/60:.1f}min | vocab={tok.get_vocab_size():,}")
     return tok
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §11  SAVE
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def save_tokenizer(tok: Tokenizer) -> dict:
     Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
     vocab = tok.get_vocab()
@@ -481,9 +500,9 @@ def save_tokenizer(tok: Tokenizer) -> dict:
     log.info(f"[SAVE] All files written to {SAVE_DIR}/")
     return {"tokenizer_json": tj_path, "config": cfg_path, "stm": stm_path}
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §12  UPLOAD
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def upload_to_hub(file_paths: dict) -> None:
     api = HfApi()
     log.info(f"[UPLOAD] Pushing to '{REPO_ID}'...")
@@ -499,9 +518,9 @@ def upload_to_hub(file_paths: dict) -> None:
     except Exception as e:
         log.error(f"[UPLOAD] Failed (files saved locally at {SAVE_DIR}): {e}")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §13  SMOKE TESTS
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def run_smoke_tests() -> None:
     print("\n" + "─" * 60)
     print("  SMOKE TESTS")
@@ -539,9 +558,9 @@ def run_smoke_tests() -> None:
     print("  [✓] '3.14159' → 6 digit tokens ✓")
     print("─" * 60 + "\n")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §14  VERIFICATION
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def run_verification() -> None:
     from transformers import PreTrainedTokenizerFast
 
@@ -587,13 +606,14 @@ def run_verification() -> None:
 
     print("\n" + "═" * 68 + "\n")
 
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 # §15  MAIN
-# ══════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
 def main():
     print("\n" + "█" * 60)
     print(f"  ZENYX-V2  |  vocab={VOCAB_SIZE:,}  |  corpus={TARGET_CORPUS_BYTES/1e9:.1f}GB")
     print("  MODE: TRUE STREAMING  —  No spool file, direct to BPE trainer")
+    print("  CODE: bigcode/starcoderdata (25 languages, real content col)")
     print("█" * 60 + "\n")
 
     ckpt = load_checkpoint()
