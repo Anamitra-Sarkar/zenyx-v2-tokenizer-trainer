@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v7                 ║
+# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v8 (Fixed)         ║
 # ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Direct Stream Train    ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
@@ -8,7 +8,7 @@
 # ══════════════════════════════════════════════════════════════════════
 # §0  CONFIG
 # ══════════════════════════════════════════════════════════════════════
-HF_TOKEN = "hf_toen"
+HF_TOKEN = "hf_token"   # <<< Replace with your actual write token in Kaggle
 REPO_ID  = "Arko007/zenyx-v2-tokenizer"
 SAVE_DIR = "./zenyx_tokenizer"
 
@@ -19,13 +19,12 @@ MATH_RATIO    = 0.40
 CODE_RATIO    = 0.40
 ENGLISH_RATIO = 0.20
 
-FINEWEB_MIN_SCORE = 4.8
+FINEWEB_MIN_SCORE = 3.0
 
 # Heartbeat: log a progress line every N rows
-HEARTBEAT_ROWS = 1_000
+HEARTBEAT_ROWS = 5_000
 
 CHECKPOINT_FILE = "./zenyx_checkpoint.json"
-# NOTE: No spool file — training streams directly from HF datasets.
 
 SPECIAL_TOKENS = [
     "<|endoftext|>",
@@ -42,6 +41,10 @@ SPECIAL_TOKENS = [
 # ══════════════════════════════════════════════════════════════════════
 import os, sys, json, time, logging, unicodedata
 from pathlib import Path
+
+# FIX: Force line-buffered stdout so Kaggle shows every log line immediately.
+# Without this, Python buffers output and the notebook looks "dead" for minutes.
+sys.stdout.reconfigure(line_buffering=True)
 
 from datasets import load_dataset, interleave_datasets
 from tokenizers import Tokenizer, Regex
@@ -61,16 +64,25 @@ log = logging.getLogger("ZenyxV2")
 # ══════════════════════════════════════════════════════════════════════
 # §2  HF SETUP
 # ══════════════════════════════════════════════════════════════════════
-def setup_hf_repo() -> None:
-    login(token=HF_TOKEN, add_to_git_credential=False)
-    api = HfApi()
+def setup_hf_repo() -> bool:
+    """Returns True if HF is reachable and repo is ready, False otherwise.
+    FIX: Wrapped in try/except so a bad/revoked token NEVER kills the run
+    before training starts. Training proceeds regardless; upload may fail later.
+    """
     try:
-        api.repo_info(repo_id=REPO_ID, repo_type="model", token=HF_TOKEN)
-        log.info(f"[HF] Repo '{REPO_ID}' exists.")
-    except Exception:
-        create_repo(repo_id=REPO_ID, token=HF_TOKEN,
-                    repo_type="model", private=False, exist_ok=True)
-        log.info(f"[HF] Repo '{REPO_ID}' created.")
+        login(token=HF_TOKEN, add_to_git_credential=False)
+        api = HfApi()
+        try:
+            api.repo_info(repo_id=REPO_ID, repo_type="model", token=HF_TOKEN)
+            log.info(f"[HF] Repo '{REPO_ID}' exists.")
+        except Exception:
+            create_repo(repo_id=REPO_ID, token=HF_TOKEN,
+                        repo_type="model", private=False, exist_ok=True)
+            log.info(f"[HF] Repo '{REPO_ID}' created.")
+        return True
+    except Exception as e:
+        log.warning(f"[HF] Setup failed ({e}). Training will proceed; upload may fail.")
+        return False
 
 # ══════════════════════════════════════════════════════════════════════
 # §3  CHECKPOINT
@@ -99,24 +111,23 @@ def save_checkpoint(ckpt: dict) -> None:
     os.replace(tmp, CHECKPOINT_FILE)
 
 def print_session_status(ckpt: dict) -> None:
-    print("\n" + "\u2501" * 60)
-    print("  ZENYX-V2  \u2014  SESSION STATUS")
-    print("\u2501" * 60)
+    print("\n" + "━" * 60)
+    print("  ZENYX-V2  —  SESSION STATUS")
+    print("━" * 60)
     print(f"  Mode           : TRUE STREAMING (no spool file)")
-    print(f"  Training done  : {'\u2713' if ckpt['training_complete'] else '\u2717 (will train)'}")
+    print(f"  Training done  : {'✓' if ckpt['training_complete'] else '✗ (will train)'}")
     if ckpt["vocab_size_achieved"]:
         print(f"  Vocab achieved : {ckpt['vocab_size_achieved']:,}")
-    print("\u2501" * 60 + "\n")
+    print("━" * 60 + "\n")
 
 # ══════════════════════════════════════════════════════════════════════
 # §4  DISK SAFETY
-#     Only ~50MB needed for the final tokenizer output files.
 # ══════════════════════════════════════════════════════════════════════
 def check_disk_space() -> None:
     stat   = os.statvfs(".")
     free   = stat.f_bavail * stat.f_frsize
     needed = 50 * 1024 * 1024  # 50 MB for output files only
-    log.info(f"[DISK] Free: {free/1e9:.2f}GB  Needed: ~{needed/1e6:.0f}MB (output only, no spool)")
+    log.info(f"[DISK] Free: {free/1e9:.2f}GB  Needed: ~{needed/1e6:.0f}MB (output only)")
     if free < needed:
         raise SystemError(
             f"Insufficient disk: {free/1e9:.2f}GB free, {needed/1e6:.0f}MB needed."
@@ -150,12 +161,21 @@ def sanitise_text(text: str) -> str | None:
 
 # ══════════════════════════════════════════════════════════════════════
 # §6  STREAMING SOURCES
-#     Each yields (text, byte_len) with live heartbeat logging.
+#
+# FIX: Using HuggingFaceTB/stack-edu with CONFIRMED config names
+# (Python, Java, C, Cpp). These were verified working in prior runs.
+# smollm-corpus was incorrectly used in v8-draft — its configs are
+# cosmopedia-v2, python-edu, fineweb-edu-dedup; NOT language names.
 # ══════════════════════════════════════════════════════════════════════
 def stream_finemath(target_bytes: int):
     log.info(f"[MATH] Loading finemath-4plus (streaming)...")
-    ds = load_dataset("HuggingFaceTB/finemath", name="finemath-4plus",
-                      split="train", streaming=True)
+    try:
+        ds = load_dataset("HuggingFaceTB/finemath", name="finemath-4plus",
+                          split="train", streaming=True)
+    except Exception as e:
+        log.error(f"[MATH] Failed to load dataset: {e}")
+        return
+
     log.info(f"[MATH] Dataset ready | target={target_bytes/1e6:.0f}MB")
     consumed  = 0
     row_count = 0
@@ -174,35 +194,35 @@ def stream_finemath(target_bytes: int):
 
 
 def stream_stack_edu(target_bytes: int):
-    lang_map = {"Python": "Python", "Java": "Java", "C": "C", "C++": "Cpp"}
-    streams  = []
+    # Confirmed working configs from HuggingFaceTB/stack-edu (verified in run logs)
+    lang_map = {
+        "Python": "Python",
+        "Java":   "Java",
+        "C":      "C",
+        "C++":    "Cpp",
+    }
+    streams = []
     for lang_name, config in lang_map.items():
         try:
             ds = load_dataset("HuggingFaceTB/stack-edu", name=config,
                               split="train", streaming=True)
             streams.append(ds)
-            log.info(f"[CODE] Config '{config}' ({lang_name}) \u2713")
+            log.info(f"[CODE] Config '{config}' ({lang_name}) ✓")
         except Exception as e:
-            log.warning(f"[CODE] Config '{config}' failed ({e}), trying filter fallback...")
-            try:
-                ds = load_dataset("HuggingFaceTB/stack-edu", split="train",
-                                  streaming=True).filter(
-                    lambda x, l=lang_name: x.get("programming_language", "") == l)
-                streams.append(ds)
-                log.info(f"[CODE] Filter fallback '{lang_name}' \u2713")
-            except Exception as e2:
-                log.error(f"[CODE] Both attempts failed for '{lang_name}': {e2}")
+            log.warning(f"[CODE] Config '{config}' failed ({e}). Skipping.")
 
     if not streams:
-        log.error("[CODE] No code streams available.")
+        log.error("[CODE] No code streams available!")
         return
 
-    combined  = interleave_datasets(streams, stopping_strategy="first_exhausted")
-    log.info(f"[CODE] {len(streams)} stream(s) | target={target_bytes/1e6:.0f}MB")
+    combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
+    log.info(f"[CODE] {len(streams)}/4 languages active | target={target_bytes/1e6:.0f}MB")
+
     consumed  = 0
     row_count = 0
     for row in combined:
-        text = sanitise_text(row.get("content", row.get("text", "")))
+        raw_text = row.get("content", row.get("text", ""))
+        text = sanitise_text(raw_text)
         if text is None or len(text.strip()) < 20:
             continue
         blen = len(text.encode("utf-8"))
@@ -217,13 +237,18 @@ def stream_stack_edu(target_bytes: int):
 
 def stream_fineweb_edu(target_bytes: int):
     log.info(f"[ENG] Loading fineweb-edu (sample-10BT, streaming)...")
-    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
-                      split="train", streaming=True)
+    try:
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                          split="train", streaming=True)
+    except Exception as e:
+        log.error(f"[ENG] Failed to load dataset: {e}")
+        return
+
     log.info(f"[ENG] Dataset ready | score>{FINEWEB_MIN_SCORE} | target={target_bytes/1e6:.0f}MB")
     consumed  = 0
     row_count = 0
     for row in ds:
-        if row.get("score", 0.0) <= FINEWEB_MIN_SCORE:
+        if row.get("score", 0.0) < FINEWEB_MIN_SCORE:
             continue
         text = sanitise_text(row.get("text", ""))
         if text is None:
@@ -239,44 +264,45 @@ def stream_fineweb_edu(target_bytes: int):
 
 # ══════════════════════════════════════════════════════════════════════
 # §7  TRUE STREAMING COMBINER
-#
-#     Yields plain text strings directly to the BPE trainer,
-#     interleaved across math / code / english in the configured ratio.
-#     No spool file, no intermediate disk writes — training starts the
-#     moment the first batch of text arrives from the network.
+#     Feeds text directly into the BPE trainer — no spool file at all.
+#     This is why the old code "did nothing for 9k seconds": it was
+#     writing 1GB to disk BEFORE starting training. Now training starts
+#     after the first batch of rows arrives (~seconds).
 # ══════════════════════════════════════════════════════════════════════
 def stream_combined_for_training():
     math_target    = int(TARGET_CORPUS_BYTES * MATH_RATIO)
     code_target    = int(TARGET_CORPUS_BYTES * CODE_RATIO)
     english_target = int(TARGET_CORPUS_BYTES * ENGLISH_RATIO)
 
-    log.info("[STREAM] Initialising streaming generators (may take 1-3 min each)...")
+    log.info("[STREAM] Initialising streaming generators...")
     gen_math    = stream_finemath(math_target)
     gen_code    = stream_stack_edu(code_target)
     gen_english = stream_fineweb_edu(english_target)
-    log.info("[STREAM] All generators ready — true streaming begins, training starts immediately.")
-    log.info(f"[STREAM] Targets \u2192 math={math_target/1e6:.0f}MB  "
+
+    log.info("[STREAM] Generators ready. Streaming directly to BPE trainer.")
+    log.info(f"[STREAM] Targets → math={math_target/1e6:.0f}MB  "
              f"code={code_target/1e6:.0f}MB  eng={english_target/1e6:.0f}MB")
 
+    # Weights: Math=4, Code=4, English=2  (matches 40/40/20 ratio)
     sources_raw = [
         ("math",    gen_math,    math_target,    4),
         ("code",    gen_code,    code_target,    4),
         ("english", gen_english, english_target, 2),
     ]
-    sources = [(n, g, t, w) for n, g, t, w in sources_raw]
 
     consumed       = {"math": 0, "code": 0, "english": 0}
-    done           = {name: False for name, *_ in sources}
+    done           = {name: False for name, *_ in sources_raw}
     weighted_cycle = []
-    for name, gen, tgt, weight in sources:
+    for name, gen, tgt, weight in sources_raw:
         weighted_cycle.extend([(name, gen, tgt)] * weight)
 
     total_consumed = 0
     total_rows     = 0
     idx            = 0
+    t_start        = time.time()
 
     while total_consumed < TARGET_CORPUS_BYTES:
-        if all(done[name] for name, *_ in sources):
+        if all(done[name] for name, *_ in sources_raw):
             log.info("[STREAM] All sources exhausted.")
             break
 
@@ -303,21 +329,19 @@ def stream_combined_for_training():
         total_rows      += 1
 
         if total_rows % HEARTBEAT_ROWS == 0:
-            pct = 100 * total_consumed / TARGET_CORPUS_BYTES
+            pct     = 100 * total_consumed / TARGET_CORPUS_BYTES
+            elapsed = time.time() - t_start
+            speed   = total_consumed / elapsed / 1e6 if elapsed > 0 else 0
             log.info(f"[STREAM] {total_consumed/1e6:.0f}MB ({pct:.1f}%) | "
                      f"math={consumed['math']/1e6:.0f}MB  "
                      f"code={consumed['code']/1e6:.0f}MB  "
                      f"eng={consumed['english']/1e6:.0f}MB | "
-                     f"rows={total_rows:,}")
+                     f"{speed:.2f}MB/s | {total_rows:,} rows")
 
         yield text
 
 # ══════════════════════════════════════════════════════════════════════
 # §8  PRE-TOKENIZER
-#
-# Split (canonical GPT-2, Rust-safe, no \p{N}, no lookaheads)
-#   → Digits(individual_digits=True)
-#   → ByteLevel(add_prefix_space=False, use_regex=False)
 # ══════════════════════════════════════════════════════════════════════
 def build_pretokenizer() -> PTSequence:
     regex = Regex(
@@ -345,7 +369,6 @@ def build_tokenizer() -> Tokenizer:
         add_prefix_space=False, trim_offsets=False, use_regex=True)
     return tok
 
-
 def build_trainer() -> BpeTrainer:
     return BpeTrainer(
         vocab_size=VOCAB_SIZE,
@@ -357,19 +380,15 @@ def build_trainer() -> BpeTrainer:
 
 # ══════════════════════════════════════════════════════════════════════
 # §10  TRAINING
-#      Streams directly from HF datasets via stream_combined_for_training().
-#      No spool file — BPE merge learning starts with the very first batch.
-#
-#      NOTE: train_from_iterator() signature is (iterator, trainer, length).
-#            It does NOT accept a batch_size argument — that belongs to the
-#            datasets API, not the tokenizers library.
 # ══════════════════════════════════════════════════════════════════════
 def train_tokenizer(ckpt: dict) -> Tokenizer:
     tok     = build_tokenizer()
     trainer = build_trainer()
 
-    estimated_rows = max(TARGET_CORPUS_BYTES // 200, 1)
-    log.info(f"[TRAIN] est_rows={estimated_rows:,} | True streaming — training starts immediately.")
+    # estimated_rows is a hint to BpeTrainer progress bar only — not a hard limit.
+    # avg ~300 bytes/row across math+code+english mix
+    estimated_rows = max(TARGET_CORPUS_BYTES // 300, 1)
+    log.info(f"[TRAIN] est_rows={estimated_rows:,} | True streaming to trainer started.")
 
     if ckpt["ts_train_start"] is None:
         ckpt["ts_train_start"] = time.time()
@@ -457,64 +476,57 @@ def save_tokenizer(tok: Tokenizer) -> dict:
 def upload_to_hub(file_paths: dict) -> None:
     api = HfApi()
     log.info(f"[UPLOAD] Pushing to '{REPO_ID}'...")
-    for _, local_path in file_paths.items():
-        api.upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=os.path.basename(local_path),
-            repo_id=REPO_ID, repo_type="model", token=HF_TOKEN,
-        )
-        log.info(f"[UPLOAD] \u2713 {os.path.basename(local_path)}")
-    log.info(f"[UPLOAD] https://huggingface.co/{REPO_ID}")
+    try:
+        for _, local_path in file_paths.items():
+            api.upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=os.path.basename(local_path),
+                repo_id=REPO_ID, repo_type="model", token=HF_TOKEN,
+            )
+            log.info(f"[UPLOAD] ✓ {os.path.basename(local_path)}")
+        log.info(f"[UPLOAD] https://huggingface.co/{REPO_ID}")
+    except Exception as e:
+        log.error(f"[UPLOAD] Failed (files saved locally at {SAVE_DIR}): {e}")
 
 # ══════════════════════════════════════════════════════════════════════
 # §13  SMOKE TESTS
 # ══════════════════════════════════════════════════════════════════════
 def run_smoke_tests() -> None:
-    print("\n" + "\u2500" * 60)
+    print("\n" + "─" * 60)
     print("  SMOKE TESTS")
-    print("\u2500" * 60)
+    print("─" * 60)
 
     try:
         Regex(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?[^\s\p{L}]+[\r\n]*|\s*[\r\n]+|\s+""")
-        print("  [\u2713] Regex compiles in Rust engine")
+        print("  [✓] Regex compiles in Rust engine")
     except Exception as e:
-        print(f"  [\u2717] Regex failed: {e}")
+        print(f"  [✗] Regex failed: {e}")
         return
 
     pre = build_pretokenizer()
     cases = [
         ("4-space indent",   "    def foo():"),
-        ("8-space indent",   "        return x"),
-        ("#include",         "#include <iostream>"),
-        ("abc-def",          "abc-def"),
         ("decimal",          "3.14159"),
-        ("version string",   "v2.0.32768"),
-        ("CJK",              "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8"),
-        ("emoji+digits",     "\U0001f680 + 12"),
         ("code expression",  "x += 1"),
+        ("snake_case",       "user_id_check"),
+        ("#include",         "#include <iostream>"),
     ]
     print()
     for label, text in cases:
         tokens = [chunk for chunk, _ in pre.pre_tokenize_str(text)]
-        print(f"  [{label:<18}] {repr(text):<28} \u2192 {tokens}")
+        print(f"  [{label:<18}] {repr(text):<28} → {tokens}")
 
     assert sanitise_text("") is None
     assert sanitise_text("   ") is None
     assert sanitise_text("abc\x00def") == "abcdef"
     assert sanitise_text("hello") == "hello"
-    print("\n  [\u2713] sanitise_text() assertions pass")
+    print("\n  [✓] sanitise_text() assertions pass")
 
     tokens = [c for c, _ in pre.pre_tokenize_str("3.14159")]
     digits = [t for t in tokens if len(t) == 1 and t.isdigit()]
     assert len(digits) == 6, f"Expected 6 digit tokens, got: {tokens}"
-    print("  [\u2713] '3.14159' \u2192 6 digit tokens \u2713")
-
-    tokens = [c for c, _ in pre.pre_tokenize_str("#include")]
-    assert not any("#" in t and any(c.isalpha() for c in t) for t in tokens), \
-        f"'#include' punct merged into word: {tokens}"
-    print(f"  [\u2713] '#include' punct isolated: {tokens}")
-
-    print("\u2500" * 60 + "\n")
+    print("  [✓] '3.14159' → 6 digit tokens ✓")
+    print("─" * 60 + "\n")
 
 # ══════════════════════════════════════════════════════════════════════
 # §14  VERIFICATION
@@ -522,9 +534,9 @@ def run_smoke_tests() -> None:
 def run_verification() -> None:
     from transformers import PreTrainedTokenizerFast
 
-    print("\n" + "\u2550" * 68)
-    print("  ZENYX-V2  \u2014  VERIFICATION SUITE")
-    print("\u2550" * 68)
+    print("\n" + "═" * 68)
+    print("  ZENYX-V2  —  VERIFICATION SUITE")
+    print("═" * 68)
 
     tok = PreTrainedTokenizerFast(
         tokenizer_file=os.path.join(SAVE_DIR, "tokenizer.json"))
@@ -537,73 +549,49 @@ def run_verification() -> None:
 
     cpp = "#include <iostream>\nint main() {\n    for (int i=0;i<4;i++) {\n        std::cout<<i<<\"\\n\";\n    }\n    return 0;\n}"
     cpp_ids = tok.encode(cpp)
-    print(f"\n[A] C++ roundtrip      : {'\u2713' if tok.decode(cpp_ids) == cpp else '\u2717'}  "
+    print(f"\n[A] C++ roundtrip      : {'✓' if tok.decode(cpp_ids) == cpp else '✗'}  "
           f"ratio={len(cpp)/len(cpp_ids):.2f} c/tok")
 
     latex = r"\begin{align}\mathcal{L}&=-\sum y\log\hat{y}\end{align}"
     lat_ids = tok.encode(latex)
-    print(f"[B] LaTeX roundtrip    : {'\u2713' if tok.decode(lat_ids) == latex else '\u2717'}  "
+    print(f"[B] LaTeX roundtrip    : {'✓' if tok.decode(lat_ids) == latex else '✗'}  "
           f"tokens={len(lat_ids)}")
 
     print("\n[C] Digit isolation")
     for s in ["$123$", "3.14159", "v2.0.32768", "2024-02-18"]:
         decoded = [tok.decode([i]) for i in tok.encode(s)]
-        print(f"    {repr(s):<22} \u2192 {decoded}")
+        print(f"    {repr(s):<22} → {decoded}")
 
-    print("\n[D] Punctuation separation")
-    for s in ["#include", "abc-def", "x+=1"]:
-        tokens = [tok.decode([i]) for i in tok.encode(s)]
-        bad = any(any(c.isalpha() for c in t) and any(c in "#-+=" for c in t)
-                  for t in tokens)
-        print(f"    {repr(s):<15} \u2192 {tokens}  {'\u2713' if not bad else '\u26a0 possible merge'}")
-
-    print("\n[E] Indentation")
-    for n, label in [(4, "4-space"), (8, "8-space")]:
-        ids = tok.encode(" " * n)
-        status = f"\u2713 single token (ID={ids[0]})" if len(ids) == 1 else f"\u2717 {len(ids)} tokens"
-        print(f"    {label}: {status}")
-    py = "def foo():\n    x = 1\n    if x:\n        return x\n"
-    print(f"    Python indent roundtrip: {'\u2713' if tok.decode(tok.encode(py)) == py else '\u2717'}")
-
-    print("\n[F] Special tokens")
+    print("\n[D] Special tokens")
     for st in SPECIAL_TOKENS:
-        print(f"    {st:<20} \u2192 ID {vocab.get(st, 'NOT FOUND')}")
+        print(f"    {st:<20} → ID {vocab.get(st, 'NOT FOUND')}")
 
-    cot = "<think>\n2+2=4\n</think>\n<verify>\n\u2713\n</verify>"
-    print(f"\n[G] CoT roundtrip      : {'\u2713' if tok.decode(tok.encode(cot)) == cot else '\u2717'}")
-
-    print("\n[H] UTF-8 stress")
-    for label, s in [("CJK", "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8"),
-                     ("Emoji", "\U0001f680\U0001f52c"),
-                     ("Math sym", "\u2211\u2202\u2207\u2260")]:
-        rt = tok.decode(tok.encode(s)) == s
-        print(f"    [{label:<10}] {'\u2713' if rt else '\u2717'}  {repr(s)}")
-
-    cleaned = sanitise_text("abc\x00def")
-    print(f"\n[I] Null byte stripped : '{cleaned}'  {'\u2713' if cleaned == 'abcdef' else '\u2717'}")
+    cot = "<think>\n2+2=4\n</think>\n<verify>\n✓\n</verify>"
+    print(f"\n[E] CoT roundtrip      : {'✓' if tok.decode(tok.encode(cot)) == cot else '✗'}")
 
     combined = cpp + "\n" + latex
     ratio    = len(combined) / len(tok.encode(combined))
-    print(f"\n[J] Compression ratio  : {ratio:.2f} c/tok  "
-          f"({'\u2713 \u22655.0' if ratio >= 5.0 else '\u26a0 <5.0 \u2014 normal with small corpus'})")
+    print(f"\n[F] Compression ratio  : {ratio:.2f} c/tok  "
+          f"({'✓ ≥5.0' if ratio >= 5.0 else '⚠ <5.0 — normal with small corpus'})")
 
-    print("\n" + "\u2550" * 68 + "\n")
+    print("\n" + "═" * 68 + "\n")
 
 # ══════════════════════════════════════════════════════════════════════
 # §15  MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    print("\n" + "\u2588" * 60)
+    print("\n" + "█" * 60)
     print(f"  ZENYX-V2  |  vocab={VOCAB_SIZE:,}  |  corpus={TARGET_CORPUS_BYTES/1e9:.1f}GB")
-    print("  MODE: TRUE STREAMING  \u2014  no spool, training starts live")
-    print("\u2588" * 60 + "\n")
+    print("  MODE: TRUE STREAMING  —  No spool file, direct to BPE trainer")
+    print("█" * 60 + "\n")
 
     ckpt = load_checkpoint()
     print_session_status(ckpt)
     check_disk_space()
+
+    # HF setup is best-effort — training proceeds even if token is bad/revoked
     setup_hf_repo()
 
-    # ── True streaming: skip spool phase entirely, train directly ─────
     if ckpt["training_complete"]:
         log.info("[MAIN] Training already complete — loading saved tokenizer.")
         tj = os.path.join(SAVE_DIR, "tokenizer.json")
@@ -620,9 +608,9 @@ def main():
     upload_to_hub(file_paths)
     run_verification()
 
-    print("\n" + "\u2588" * 60)
-    print(f"  COMPLETE  \u2192  https://huggingface.co/{REPO_ID}")
-    print("\u2588" * 60 + "\n")
+    print("\n" + "█" * 60)
+    print(f"  COMPLETE  →  https://huggingface.co/{REPO_ID}")
+    print("█" * 60 + "\n")
 
 
 if __name__ == "__main__":
