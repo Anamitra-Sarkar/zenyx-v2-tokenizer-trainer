@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   ZENYX-V2 TOKENIZER TRAINER  —  FINAL PRODUCTION v6               ║
-# ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Truly Resumable        ║
+# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v7                 ║
+# ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Direct Stream Train    ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 !pip install -U -q transformers datasets tokenizers huggingface_hub
@@ -19,15 +19,14 @@ MATH_RATIO    = 0.40
 CODE_RATIO    = 0.40
 ENGLISH_RATIO = 0.20
 
-FINEWEB_MIN_SCORE      = 4.8
-TRAIN_BATCH_SIZE       = 1_000
-CHECKPOINT_INTERVAL_MB = 50
+FINEWEB_MIN_SCORE = 4.8
+TRAIN_BATCH_SIZE  = 1_000
 
-# Heartbeat: log a progress line every N rows even before first checkpoint
+# Heartbeat: log a progress line every N rows
 HEARTBEAT_ROWS = 1_000
 
 CHECKPOINT_FILE = "./zenyx_checkpoint.json"
-SPOOL_FILE      = "./zenyx_spool.jsonl"
+# NOTE: No spool file — training streams directly from HF datasets.
 
 SPECIAL_TOKENS = [
     "<|endoftext|>",
@@ -51,7 +50,6 @@ from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel, Digits, Split, Sequence as PTSequence
 from tokenizers import processors, decoders
-# HfFolder was removed in huggingface_hub>=0.20 — use login() instead
 from huggingface_hub import HfApi, login, create_repo
 
 logging.basicConfig(
@@ -65,7 +63,6 @@ log = logging.getLogger("ZenyxV2")
 # §2  HF SETUP
 # ══════════════════════════════════════════════════════════════════════
 def setup_hf_repo() -> None:
-    # login() persists the token to ~/.cache/huggingface/token
     login(token=HF_TOKEN, add_to_git_credential=False)
     api = HfApi()
     try:
@@ -80,15 +77,10 @@ def setup_hf_repo() -> None:
 # §3  CHECKPOINT
 # ══════════════════════════════════════════════════════════════════════
 EMPTY_CKPT = {
-    "rows_math": 0, "rows_code": 0, "rows_english": 0,
-    "bytes_math": 0, "bytes_code": 0, "bytes_english": 0,
-    "bytes_written": 0,
-    "spool_offset": 0,
-    "spool_complete": False,
-    "training_complete": False,
+    "training_complete":   False,
     "vocab_size_achieved": 0,
-    "ts_spool_start": None, "ts_spool_end": None,
-    "ts_train_start": None, "ts_train_end": None,
+    "ts_train_start":      None,
+    "ts_train_end":        None,
 }
 
 def load_checkpoint() -> dict:
@@ -108,33 +100,27 @@ def save_checkpoint(ckpt: dict) -> None:
     os.replace(tmp, CHECKPOINT_FILE)
 
 def print_session_status(ckpt: dict) -> None:
-    done_mb  = ckpt["bytes_written"] / 1e6
-    total_mb = TARGET_CORPUS_BYTES / 1e6
-    pct      = 100 * ckpt["bytes_written"] / TARGET_CORPUS_BYTES
     print("\n" + "\u2501" * 60)
     print("  ZENYX-V2  \u2014  SESSION STATUS")
     print("\u2501" * 60)
-    print(f"  Corpus spooled : {done_mb:.1f} MB / {total_mb:.0f} MB ({pct:.1f}%)")
-    print(f"  Rows           : math={ckpt['rows_math']:,}  "
-          f"code={ckpt['rows_code']:,}  eng={ckpt['rows_english']:,}")
-    print(f"  Bytes per src  : math={ckpt['bytes_math']/1e6:.1f}MB  "
-          f"code={ckpt['bytes_code']/1e6:.1f}MB  "
-          f"eng={ckpt['bytes_english']/1e6:.1f}MB")
-    print(f"  Spool complete : {'\u2713' if ckpt['spool_complete'] else '\u2717 (will resume)'}")
+    print(f"  Mode           : TRUE STREAMING (no spool file)")
     print(f"  Training done  : {'\u2713' if ckpt['training_complete'] else '\u2717 (will train)'}")
+    if ckpt["vocab_size_achieved"]:
+        print(f"  Vocab achieved : {ckpt['vocab_size_achieved']:,}")
     print("\u2501" * 60 + "\n")
 
 # ══════════════════════════════════════════════════════════════════════
 # §4  DISK SAFETY
+#     Only ~50MB needed for the final tokenizer output files.
 # ══════════════════════════════════════════════════════════════════════
 def check_disk_space() -> None:
     stat   = os.statvfs(".")
     free   = stat.f_bavail * stat.f_frsize
-    needed = TARGET_CORPUS_BYTES * 2.5
-    log.info(f"[DISK] Free: {free/1e9:.2f}GB  Needed: {needed/1e9:.2f}GB")
+    needed = 50 * 1024 * 1024  # 50 MB for output files only
+    log.info(f"[DISK] Free: {free/1e9:.2f}GB  Needed: ~{needed/1e6:.0f}MB (output only, no spool)")
     if free < needed:
         raise SystemError(
-            f"Insufficient disk: {free/1e9:.2f}GB free, {needed/1e9:.2f}GB needed."
+            f"Insufficient disk: {free/1e9:.2f}GB free, {needed/1e6:.0f}MB needed."
         )
 
 # ══════════════════════════════════════════════════════════════════════
@@ -165,17 +151,14 @@ def sanitise_text(text: str) -> str | None:
 
 # ══════════════════════════════════════════════════════════════════════
 # §6  STREAMING SOURCES
-#     Each yields (text, byte_len). skip_rows enables true resume.
-#     NOTE: .skip(n) is O(n) — resume time scales with rows skipped.
+#     Each yields (text, byte_len) with live heartbeat logging.
 # ══════════════════════════════════════════════════════════════════════
-def stream_finemath(target_bytes: int, skip_rows: int = 0):
-    log.info(f"[MATH] Loading finemath-4plus...")
+def stream_finemath(target_bytes: int):
+    log.info(f"[MATH] Loading finemath-4plus (streaming)...")
     ds = load_dataset("HuggingFaceTB/finemath", name="finemath-4plus",
                       split="train", streaming=True)
-    log.info(f"[MATH] Dataset ready | skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
-    if skip_rows > 0:
-        ds = ds.skip(skip_rows)
-    consumed = 0
+    log.info(f"[MATH] Dataset ready | target={target_bytes/1e6:.0f}MB")
+    consumed  = 0
     row_count = 0
     for row in ds:
         text = sanitise_text(row.get("text", ""))
@@ -183,7 +166,7 @@ def stream_finemath(target_bytes: int, skip_rows: int = 0):
             continue
         blen = len(text.encode("utf-8"))
         yield text, blen
-        consumed += blen
+        consumed  += blen
         row_count += 1
         if row_count % HEARTBEAT_ROWS == 0:
             log.info(f"[MATH] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
@@ -191,8 +174,7 @@ def stream_finemath(target_bytes: int, skip_rows: int = 0):
             break
 
 
-def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
-    # Config names from dataset README: Python, Java, C, Cpp
+def stream_stack_edu(target_bytes: int):
     lang_map = {"Python": "Python", "Java": "Java", "C": "C", "C++": "Cpp"}
     streams  = []
     for lang_name, config in lang_map.items():
@@ -216,12 +198,9 @@ def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
         log.error("[CODE] No code streams available.")
         return
 
-    combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
-    if skip_rows > 0:
-        combined = combined.skip(skip_rows)
-    log.info(f"[CODE] {len(streams)} stream(s) | skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
-
-    consumed = 0
+    combined  = interleave_datasets(streams, stopping_strategy="first_exhausted")
+    log.info(f"[CODE] {len(streams)} stream(s) | target={target_bytes/1e6:.0f}MB")
+    consumed  = 0
     row_count = 0
     for row in combined:
         text = sanitise_text(row.get("content", row.get("text", "")))
@@ -229,7 +208,7 @@ def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
             continue
         blen = len(text.encode("utf-8"))
         yield text, blen
-        consumed += blen
+        consumed  += blen
         row_count += 1
         if row_count % HEARTBEAT_ROWS == 0:
             log.info(f"[CODE] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
@@ -237,18 +216,12 @@ def stream_stack_edu(target_bytes: int, skip_rows: int = 0):
             break
 
 
-def stream_fineweb_edu(target_bytes: int, skip_rows: int = 0):
-    # FIX v6: use sample-10BT instead of CC-MAIN-2024-10
-    # CC-MAIN-2024-10 is a raw dump shard (~500GB+), extremely slow to init on Kaggle.
-    # sample-10BT is the official recommended config: pre-deduplicated, fast to stream.
-    log.info(f"[ENG] Loading fineweb-edu (sample-10BT)...")
+def stream_fineweb_edu(target_bytes: int):
+    log.info(f"[ENG] Loading fineweb-edu (sample-10BT, streaming)...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
-    log.info(f"[ENG] Dataset ready | score>{FINEWEB_MIN_SCORE} | "
-             f"skip={skip_rows:,} | target={target_bytes/1e6:.0f}MB")
-    if skip_rows > 0:
-        ds = ds.skip(skip_rows)
-    consumed = 0
+    log.info(f"[ENG] Dataset ready | score>{FINEWEB_MIN_SCORE} | target={target_bytes/1e6:.0f}MB")
+    consumed  = 0
     row_count = 0
     for row in ds:
         if row.get("score", 0.0) <= FINEWEB_MIN_SCORE:
@@ -258,7 +231,7 @@ def stream_fineweb_edu(target_bytes: int, skip_rows: int = 0):
             continue
         blen = len(text.encode("utf-8"))
         yield text, blen
-        consumed += blen
+        consumed  += blen
         row_count += 1
         if row_count % HEARTBEAT_ROWS == 0:
             log.info(f"[ENG] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
@@ -266,173 +239,79 @@ def stream_fineweb_edu(target_bytes: int, skip_rows: int = 0):
             break
 
 # ══════════════════════════════════════════════════════════════════════
-# §7  CORPUS SPOOLER
+# §7  TRUE STREAMING COMBINER
+#
+#     Yields plain text strings directly to the BPE trainer,
+#     interleaved across math / code / english in the configured ratio.
+#     No spool file, no intermediate disk writes — training starts the
+#     moment the first batch of text arrives from the network.
 # ══════════════════════════════════════════════════════════════════════
-def _flush_checkpoint(sf, ckpt: dict,
-                      pending_rows: dict, pending_bytes: dict,
-                      total_consumed: int,
-                      mark_complete: bool = False) -> None:
-    """fsync spool → update checkpoint counters → save. Raises on disk error."""
-    try:
-        sf.flush()
-        os.fsync(sf.fileno())
-    except OSError as e:
-        log.error("[SPOOL] fsync failed: %s — aborting to avoid inconsistent checkpoint", e)
-        raise
-
-    current_offset = sf.tell()
-    ckpt["rows_math"]     += pending_rows["math"]
-    ckpt["rows_code"]     += pending_rows["code"]
-    ckpt["rows_english"]  += pending_rows["english"]
-    ckpt["bytes_math"]    += pending_bytes["math"]
-    ckpt["bytes_code"]    += pending_bytes["code"]
-    ckpt["bytes_english"] += pending_bytes["english"]
-    ckpt["bytes_written"]  = total_consumed
-    ckpt["spool_offset"]   = current_offset
-    if mark_complete:
-        ckpt["spool_complete"] = True
-        ckpt["ts_spool_end"]   = time.time()
-    save_checkpoint(ckpt)
-
-    for d in (pending_rows, pending_bytes):
-        for k in d:
-            d[k] = 0
-
-
-def spool_corpus_to_disk(ckpt: dict) -> None:
-    if ckpt["spool_complete"]:
-        log.info("[SPOOL] Already complete — skipping.")
-        return
-
-    # Truncate to last committed offset (removes un-checkpointed tail)
-    committed_offset = ckpt.get("spool_offset", 0)
-    if committed_offset > 0 and os.path.exists(SPOOL_FILE):
-        with open(SPOOL_FILE, "a+b") as f:
-            f.truncate(committed_offset)
-        log.info(f"[SPOOL] Truncated to committed offset {committed_offset/1e6:.2f}MB.")
-    elif committed_offset == 0 and os.path.exists(SPOOL_FILE):
-        os.remove(SPOOL_FILE)
-        log.info("[SPOOL] No committed data — removed stale spool.")
-
+def stream_combined_for_training():
     math_target    = int(TARGET_CORPUS_BYTES * MATH_RATIO)
     code_target    = int(TARGET_CORPUS_BYTES * CODE_RATIO)
     english_target = int(TARGET_CORPUS_BYTES * ENGLISH_RATIO)
 
-    log.info("[SPOOL] Initialising all three generators (may take 1-3 min each)...")
-    gen_math    = stream_finemath(math_target,       skip_rows=ckpt["rows_math"])
-    gen_code    = stream_stack_edu(code_target,      skip_rows=ckpt["rows_code"])
-    gen_english = stream_fineweb_edu(english_target, skip_rows=ckpt["rows_english"])
-    log.info("[SPOOL] All generators initialised. Starting interleaved write loop.")
+    log.info("[STREAM] Initialising streaming generators (may take 1-3 min each)...")
+    gen_math    = stream_finemath(math_target)
+    gen_code    = stream_stack_edu(code_target)
+    gen_english = stream_fineweb_edu(english_target)
+    log.info("[STREAM] All generators ready — true streaming begins, training starts immediately.")
+    log.info(f"[STREAM] Targets \u2192 math={math_target/1e6:.0f}MB  "
+             f"code={code_target/1e6:.0f}MB  eng={english_target/1e6:.0f}MB")
 
     sources_raw = [
         ("math",    gen_math,    math_target,    4),
         ("code",    gen_code,    code_target,    4),
         ("english", gen_english, english_target, 2),
     ]
-    sources = [(n, g, t, w) for n, g, t, w in sources_raw if g is not None]
-    if not sources:
-        raise RuntimeError("[SPOOL] All generators returned None — cannot build corpus.")
+    sources = [(n, g, t, w) for n, g, t, w in sources_raw]
 
-    consumed = {
-        "math":    ckpt.get("bytes_math",    0),
-        "code":    ckpt.get("bytes_code",    0),
-        "english": ckpt.get("bytes_english", 0),
-    }
-    done = {name: consumed[name] >= tgt for name, _, tgt, _ in sources}
-
+    consumed       = {"math": 0, "code": 0, "english": 0}
+    done           = {name: False for name, *_ in sources}
     weighted_cycle = []
     for name, gen, tgt, weight in sources:
         weighted_cycle.extend([(name, gen, tgt)] * weight)
 
-    pending_rows  = {"math": 0, "code": 0, "english": 0}
-    pending_bytes = {"math": 0, "code": 0, "english": 0}
-
-    total_consumed = ckpt["bytes_written"]
-    next_ckpt_at   = total_consumed + CHECKPOINT_INTERVAL_MB * 1024 * 1024
+    total_consumed = 0
     total_rows     = 0
+    idx            = 0
 
-    if ckpt["ts_spool_start"] is None:
-        ckpt["ts_spool_start"] = time.time()
-        save_checkpoint(ckpt)
+    while total_consumed < TARGET_CORPUS_BYTES:
+        if all(done[name] for name, *_ in sources):
+            log.info("[STREAM] All sources exhausted.")
+            break
 
-    log.info(f"[SPOOL] Starting from {total_consumed/1e6:.1f}MB | "
-             f"math={consumed['math']/1e6:.1f}MB  "
-             f"code={consumed['code']/1e6:.1f}MB  "
-             f"eng={consumed['english']/1e6:.1f}MB")
+        name, gen, tgt = weighted_cycle[idx % len(weighted_cycle)]
+        idx += 1
 
-    idx = 0
-    with open(SPOOL_FILE, "a", encoding="utf-8") as sf:
-        while total_consumed < TARGET_CORPUS_BYTES:
-            if all(done[name] for name, *_ in sources):
-                log.info("[SPOOL] All sources hit their byte targets.")
-                break
+        if done[name]:
+            continue
 
-            name, gen, tgt = weighted_cycle[idx % len(weighted_cycle)]
-            idx += 1
+        try:
+            text, blen = next(gen)
+        except StopIteration:
+            done[name] = True
+            log.info(f"[STREAM] '{name}' exhausted at "
+                     f"{consumed[name]/1e6:.1f}MB (target={tgt/1e6:.0f}MB).")
+            continue
 
-            if done[name]:
-                continue
+        if consumed[name] + blen > tgt:
+            done[name] = True
+            continue
 
-            try:
-                text, blen = next(gen)
-            except StopIteration:
-                done[name] = True
-                log.info(f"[SPOOL] '{name}' exhausted at "
-                         f"{consumed[name]/1e6:.1f}MB (target={tgt/1e6:.0f}MB).")
-                continue
+        consumed[name]  += blen
+        total_consumed  += blen
+        total_rows      += 1
 
-            if consumed[name] + blen > tgt:
-                done[name] = True
-                continue
+        if total_rows % HEARTBEAT_ROWS == 0:
+            pct = 100 * total_consumed / TARGET_CORPUS_BYTES
+            log.info(f"[STREAM] {total_consumed/1e6:.0f}MB ({pct:.1f}%) | "
+                     f"math={consumed['math']/1e6:.0f}MB  "
+                     f"code={consumed['code']/1e6:.0f}MB  "
+                     f"eng={consumed['english']/1e6:.0f}MB | "
+                     f"rows={total_rows:,}")
 
-            try:
-                line = json.dumps({"t": text}, ensure_ascii=False) + "\n"
-            except (UnicodeEncodeError, ValueError):
-                line = json.dumps({"t": text}, ensure_ascii=True) + "\n"
-
-            sf.write(line)
-            consumed[name]      += blen
-            total_consumed      += blen
-            pending_rows[name]  += 1
-            pending_bytes[name] += blen
-            total_rows          += 1
-
-            if total_consumed >= next_ckpt_at:
-                _flush_checkpoint(sf, ckpt, pending_rows, pending_bytes, total_consumed)
-                pct = 100 * total_consumed / TARGET_CORPUS_BYTES
-                log.info(f"[SPOOL] {total_consumed/1e6:.0f}MB ({pct:.1f}%)  "
-                         f"math={consumed['math']/1e6:.0f}MB  "
-                         f"code={consumed['code']/1e6:.0f}MB  "
-                         f"eng={consumed['english']/1e6:.0f}MB  "
-                         f"rows={total_rows:,}")
-                next_ckpt_at = total_consumed + CHECKPOINT_INTERVAL_MB * 1024 * 1024
-
-        # Final atomic commit — spool_complete set inside same save_checkpoint call
-        _flush_checkpoint(sf, ckpt, pending_rows, pending_bytes,
-                          total_consumed, mark_complete=True)
-
-    log.info(f"[SPOOL] Complete: {total_consumed/1e6:.1f}MB | {total_rows:,} rows.")
-
-
-def spool_reader():
-    if not os.path.exists(SPOOL_FILE):
-        raise FileNotFoundError(f"Spool file not found: {SPOOL_FILE}")
-    with open(SPOOL_FILE, "r", encoding="utf-8", errors="replace") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)["t"]
-            except (json.JSONDecodeError, KeyError):
-                log.warning(f"[SPOOL] Skipping corrupt line {line_num}.")
-
-
-def count_spool_lines() -> int:
-    if not os.path.exists(SPOOL_FILE):
-        return 0
-    with open(SPOOL_FILE, "rb") as f:
-        return sum(1 for _ in f)
+        yield text
 
 # ══════════════════════════════════════════════════════════════════════
 # §8  PRE-TOKENIZER
@@ -479,26 +358,22 @@ def build_trainer() -> BpeTrainer:
 
 # ══════════════════════════════════════════════════════════════════════
 # §10  TRAINING
+#      Streams directly from HF datasets via stream_combined_for_training().
+#      No spool file — BPE merge learning starts with the very first batch.
 # ══════════════════════════════════════════════════════════════════════
 def train_tokenizer(ckpt: dict) -> Tokenizer:
     tok     = build_tokenizer()
     trainer = build_trainer()
 
-    n_lines        = count_spool_lines()
-    estimated_rows = max(n_lines, TARGET_CORPUS_BYTES // 200, 1)
-    log.info(f"[TRAIN] spool_lines={n_lines:,} | est_rows={estimated_rows:,}")
+    estimated_rows = max(TARGET_CORPUS_BYTES // 200, 1)
+    log.info(f"[TRAIN] est_rows={estimated_rows:,} | True streaming — training starts immediately.")
 
-    if ckpt["bytes_written"] < TARGET_CORPUS_BYTES * 0.05:
-        log.warning(
-            "[TRAIN] Spool is <5%% of target (%dMB) — merges may be poor. Continuing.",
-            ckpt["bytes_written"] // 1_000_000,
-        )
-
-    ckpt["ts_train_start"] = time.time()
-    save_checkpoint(ckpt)
+    if ckpt["ts_train_start"] is None:
+        ckpt["ts_train_start"] = time.time()
+        save_checkpoint(ckpt)
 
     tok.train_from_iterator(
-        iterator=spool_reader(),
+        iterator=stream_combined_for_training(),
         trainer=trainer,
         length=estimated_rows,
         batch_size=TRAIN_BATCH_SIZE,
@@ -696,7 +571,9 @@ def run_verification() -> None:
     print(f"\n[G] CoT roundtrip      : {'\u2713' if tok.decode(tok.encode(cot)) == cot else '\u2717'}")
 
     print("\n[H] UTF-8 stress")
-    for label, s in [("CJK", "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8"), ("Emoji", "\U0001f680\U0001f52c"), ("Math sym", "\u2211\u2202\u2207\u2260")]:
+    for label, s in [("CJK", "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8"),
+                     ("Emoji", "\U0001f680\U0001f52c"),
+                     ("Math sym", "\u2211\u2202\u2207\u2260")]:
         rt = tok.decode(tok.encode(s)) == s
         print(f"    [{label:<10}] {'\u2713' if rt else '\u2717'}  {repr(s)}")
 
@@ -716,6 +593,7 @@ def run_verification() -> None:
 def main():
     print("\n" + "\u2588" * 60)
     print(f"  ZENYX-V2  |  vocab={VOCAB_SIZE:,}  |  corpus={TARGET_CORPUS_BYTES/1e9:.1f}GB")
+    print("  MODE: TRUE STREAMING  \u2014  no spool, training starts live")
     print("\u2588" * 60 + "\n")
 
     ckpt = load_checkpoint()
@@ -723,8 +601,7 @@ def main():
     check_disk_space()
     setup_hf_repo()
 
-    spool_corpus_to_disk(ckpt)
-
+    # ── True streaming: skip spool phase entirely, train directly ─────
     if ckpt["training_complete"]:
         log.info("[MAIN] Training already complete — loading saved tokenizer.")
         tj = os.path.join(SAVE_DIR, "tokenizer.json")
@@ -747,6 +624,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # For mini smoke test first: set TARGET_CORPUS_BYTES = 5_000_000
     run_smoke_tests()
     main()
