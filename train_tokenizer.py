@@ -20,7 +20,6 @@ CODE_RATIO    = 0.40
 ENGLISH_RATIO = 0.20
 
 FINEWEB_MIN_SCORE = 4.8
-TRAIN_BATCH_SIZE  = 1_000
 
 # Heartbeat: log a progress line every N rows
 HEARTBEAT_ROWS = 1_000
@@ -360,6 +359,10 @@ def build_trainer() -> BpeTrainer:
 # §10  TRAINING
 #      Streams directly from HF datasets via stream_combined_for_training().
 #      No spool file — BPE merge learning starts with the very first batch.
+#
+#      NOTE: train_from_iterator() signature is (iterator, trainer, length).
+#            It does NOT accept a batch_size argument — that belongs to the
+#            datasets API, not the tokenizers library.
 # ══════════════════════════════════════════════════════════════════════
 def train_tokenizer(ckpt: dict) -> Tokenizer:
     tok     = build_tokenizer()
@@ -376,7 +379,6 @@ def train_tokenizer(ckpt: dict) -> Tokenizer:
         iterator=stream_combined_for_training(),
         trainer=trainer,
         length=estimated_rows,
-        batch_size=TRAIN_BATCH_SIZE,
     )
 
     ckpt["ts_train_end"]        = time.time()
