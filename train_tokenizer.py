@@ -1,5 +1,5 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v9                 ║
+# ║   ZENYX-V2 TOKENIZER TRAINER  —  TRUE STREAMING v10                ║
 # ║   Byte-Level BPE | 32k vocab | 1GB Corpus | Direct Stream Train    ║
 # ║   Code source: bigcode/starcoderdata (real text, 25 languages)     ║
 # ╚══════════════════════════════════════════════════════════════════════╝
@@ -40,6 +40,7 @@ SPECIAL_TOKENS = [
 # ══════════════════════════════════════════════════════════════════════════
 # §1  IMPORTS
 # ══════════════════════════════════════════════════════════════════════════
+import gc
 import os, sys, json, time, logging, unicodedata
 from pathlib import Path
 
@@ -50,7 +51,7 @@ try:
 except AttributeError:
     pass  # OutStream / any non-TextIOWrapper stdout — line-buffering not needed
 
-from datasets import load_dataset, interleave_datasets
+from datasets import load_dataset
 from tokenizers import Tokenizer, Regex
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
@@ -173,6 +174,13 @@ def sanitise_text(text: str) -> str | None:
 # Skipped (different column schema — no `content` field):
 #   jupyter-scripts-dedup-filtered, jupyter-structured-clean-dedup,
 #   github-issues-filtered-structured, git-commits-cleaned
+#
+# FIX (v10): Languages are streamed SEQUENTIALLY, one at a time, with an
+# explicit del + gc.collect() between each. The previous v9 approach opened
+# all 25 language streams simultaneously via interleave_datasets(), which
+# kept 27+ live HTTP/parquet buffers in memory concurrently and OOM-killed
+# the Kaggle kernel ~169s in. Sequential streaming keeps RAM flat.
+# BPE merge quality is unchanged — frequency counting is order-independent.
 # ══════════════════════════════════════════════════════════════════════════
 def stream_finemath(target_bytes: int):
     log.info(f"[MATH] Loading finemath-4plus (streaming)...")
@@ -203,7 +211,7 @@ def stream_finemath(target_bytes: int):
 def stream_starcoderdata(target_bytes: int):
     # 25 industry-relevant languages from bigcode/starcoderdata.
     # data_dir value = exact folder name on the HF hub (all lowercase).
-    # Any that fail to load are skipped with a warning; the rest stream normally.
+    # Languages are opened ONE AT A TIME to keep memory flat (OOM fix).
     lang_dirs = [
         # ── Tier 1: highest demand ──────────────────────────────────────
         "python",
@@ -235,9 +243,19 @@ def stream_starcoderdata(target_bytes: int):
         "scala",
     ]
 
-    streams = []
-    log.info(f"[CODE] Loading {len(lang_dirs)} languages from bigcode/starcoderdata...")
+    per_lang_bytes = target_bytes // len(lang_dirs)
+    log.info(
+        f"[CODE] Loading {len(lang_dirs)} languages sequentially | "
+        f"{per_lang_bytes/1e6:.1f}MB per language | target={target_bytes/1e6:.0f}MB"
+    )
+
+    total_consumed = 0
+    active_langs   = 0
+
     for lang in lang_dirs:
+        if total_consumed >= target_bytes:
+            break
+
         try:
             ds = load_dataset(
                 "bigcode/starcoderdata",
@@ -245,41 +263,42 @@ def stream_starcoderdata(target_bytes: int):
                 split="train",
                 streaming=True,
             )
-            streams.append(ds)
             log.info(f"[CODE]   + {lang:<20} ✓")
         except Exception as e:
             log.warning(f"[CODE]   - {lang:<20} ✗  ({e})")
-
-    if not streams:
-        log.error("[CODE] No code streams available!")
-        return
-
-    # FIX: Different language subsets of bigcode/starcoderdata carry different
-    # metadata columns (e.g. avg_line_length, max_stars_count, etc. vary by
-    # language). interleave_datasets() requires ALL streams to share identical
-    # features, so we normalise every stream to only the 'content' column —
-    # the only column we actually consume — before interleaving.
-    streams = [s.select_columns(["content"]) for s in streams]
-
-    combined = interleave_datasets(streams, stopping_strategy="first_exhausted")
-    log.info(f"[CODE] {len(streams)}/{len(lang_dirs)} languages active | "
-             f"target={target_bytes/1e6:.0f}MB")
-
-    consumed  = 0
-    row_count = 0
-    for row in combined:
-        # bigcode/starcoderdata uses `content` column for actual code text
-        text = sanitise_text(row.get("content", ""))
-        if text is None or len(text.strip()) < 20:
             continue
-        blen = len(text.encode("utf-8"))
-        yield text, blen
-        consumed  += blen
-        row_count += 1
-        if row_count % HEARTBEAT_ROWS == 0:
-            log.info(f"[CODE] heartbeat: {row_count:,} rows | {consumed/1e6:.1f}MB streamed")
-        if consumed >= target_bytes:
-            break
+
+        active_langs += 1
+        consumed  = 0
+        row_count = 0
+
+        for row in ds:
+            # bigcode/starcoderdata uses `content` column for actual code text
+            text = sanitise_text(row.get("content", ""))
+            if text is None or len(text.strip()) < 20:
+                continue
+            blen = len(text.encode("utf-8"))
+            yield text, blen
+            consumed       += blen
+            total_consumed += blen
+            row_count      += 1
+            if row_count % HEARTBEAT_ROWS == 0:
+                log.info(
+                    f"[CODE] heartbeat [{lang}]: {row_count:,} rows | "
+                    f"{consumed/1e6:.1f}MB this lang | {total_consumed/1e6:.1f}MB total"
+                )
+            if consumed >= per_lang_bytes:
+                break
+
+        # Release all parquet buffers + HTTP connections before next language
+        del ds
+        gc.collect()
+        log.info(f"[CODE]   done [{lang}]: {consumed/1e6:.1f}MB streamed")
+
+    log.info(
+        f"[CODE] {active_langs}/{len(lang_dirs)} languages active | "
+        f"target={target_bytes/1e6:.0f}MB | got={total_consumed/1e6:.0f}MB"
+    )
 
 
 def stream_fineweb_edu(target_bytes: int):
